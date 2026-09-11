@@ -44,8 +44,6 @@ RCAFNet/
 
 ## Supported Models
 
-Naming note: some source files and class names still use historical implementation names such as `carefnet` or `crossrecalibnet`. The public model registry is now normalized to `rcafnet` and `esinet`.
-
 Registered model names:
 
 - `rcafnet`: Recalibrated Cross-Attention Fusion Network.
