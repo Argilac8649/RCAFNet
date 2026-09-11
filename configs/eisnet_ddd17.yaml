@@ -1,0 +1,87 @@
+### EISNet original-style config on DDD17 ###
+
+model: esinet
+train_dataset: ddd17
+modality: rgb_event
+seed: 1
+
+data_root: /media/cdw/WD_Disk/ddd17/ddd17_seg
+img_size_wh: [346, 200]
+ori_size_hw: [260, 346]
+num_class: 6
+ignore_index: 255
+
+# EISNet uses one-channel grayscale images on DDD17.
+image_channels: 1
+force_grayscale: true
+crop_bottom: 60
+t_interval: 50
+
+# Original EISNet event representation: AET with nr_bins=3.
+frame_type: aet
+use_precomputed_events: false
+use_bilinear_voxel: false
+event_slice_mode: original
+normalize_image: false
+normalize_event: false
+
+train_dirs: [dir0, dir3, dir4, dir6, dir7]
+val_dirs: [dir1]
+test_dirs: [dir5]
+
+batch_size: 16
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+val_num_workers: 8
+val_persistent_workers: true
+val_prefetch_factor: 4
+
+# Null means one shuffled full-dataset pass per epoch, matching EISNet's
+# DataLoader(shuffle=True) behavior instead of fixed-size over/under-sampling.
+epoch_size: null
+num_epochs: 40
+log_interval: 30
+log_dir: outputs/logs
+
+learning_rate: 0.0002
+weight_decay: 0.01
+label_smoothing: 0.0
+
+scheduler:
+  type: polynomial
+  power: 1.0
+  step_per_iteration: true
+
+loss:
+  type: ce
+
+# EISNet DDD17 augmentation: random scale/crop + horizontal flip.
+augmentation:
+  hflip_prob: 0.5
+  scale_crop_prob: 1.0
+  scale_range: [1.0, 1.8]
+
+encoder:
+  backbone: mit_b2
+  rgb_backbone: mit_b2
+  event_backbone: mit_b0
+  rgb_in_chans: 1
+  aet_rep: true
+  aet_bins: 3
+  rgb_pretrained: /home/cdw/python_project/Mit_Reg/pretrained_weights/segformer_b2_backbone_weights.pth
+  event_pretrained: /home/cdw/python_project/Mit_Reg/pretrained_weights/segformer_b0_backbone_weights.pth
+  # Original EISNet reloads/reinitializes patch_embed1 for non-3-channel
+  # inputs instead of adapting RGB pretrained kernels.
+  pretrained_input_adapt: false
+  mrfm:
+    head_count: 4
+    reduction: 16
+
+decoder:
+  type: mlp
+  embed_dim: 768
+  dropout_ratio: 0.1
+  align_corners: false
+

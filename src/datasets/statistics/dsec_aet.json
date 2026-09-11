@@ -1,0 +1,35 @@
+{
+  "image_mean": [
+    0.28719648718833923,
+    0.29449471831321716,
+    0.3023000955581665
+  ],
+  "image_std": [
+    0.25342074036598206,
+    0.2676537334918976,
+    0.2863694131374359
+  ],
+  "event_mean": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "event_std": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "num_samples": 0,
+  "image_size": [
+    640,
+    440
+  ],
+  "event_channels": 6,
+  "note": "Identity event normalization for EISNet-style AET. Regenerate from the training split for dataset-level event normalization."
+}

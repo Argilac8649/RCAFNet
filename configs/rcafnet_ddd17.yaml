@@ -1,0 +1,91 @@
+### RCAFNet: Recalibrated Cross-Attention Fusion Network on DDD17 ###
+
+model: rcafnet
+train_dataset: ddd17
+modality: rgb_event
+seed: 1
+
+data_root: /media/cdw/WD_Disk/ddd17/ddd17_seg
+img_size_wh: [346, 200]
+ori_size_hw: [260, 346]
+num_class: 6
+ignore_index: 255
+
+image_channels: 1
+force_grayscale: true
+crop_bottom: 60
+t_interval: 50
+frame_type: 10c
+use_precomputed_events: true
+use_bilinear_voxel: false
+event_slice_mode: inclusive
+normalize_image: true
+normalize_event: true
+
+train_dirs: [dir0, dir3, dir4, dir6, dir7]
+val_dirs: [dir1]
+test_dirs: [dir5]
+
+batch_size: 16
+num_workers: 12
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+val_num_workers: 12
+val_persistent_workers: true
+val_prefetch_factor: 4
+
+learning_rate: 0.0002
+weight_decay: 0.004
+label_smoothing: 0.0
+
+scheduler:
+  type: warmup_cosine
+  warmup_epochs: 5
+  warmup_start_factor: 0.01
+  eta_min: 0.000001
+
+loss:
+  type: ce
+
+num_epochs: 40
+epoch_size: null
+log_interval: 30
+log_dir: outputs/logs
+
+augmentation:
+  hflip_prob: 0.5
+  scale_crop_prob: 0.3
+  scale_range: [0.8, 1.25]
+
+encoder:
+  backbone: mit_b2
+  rgb_backbone: mit_b2
+  event_backbone: mit_b0
+  rgb_in_chans: 1
+  rgb_pretrained: /home/cdw/python_project/Mit_Reg/pretrained_weights/segformer_b2_backbone_weights.pth
+  event_pretrained: /home/cdw/python_project/Mit_Reg/pretrained_weights/segformer_b0_backbone_weights.pth
+
+  cross_feature_recalibration:
+    enabled: [true, true, true, true]
+    reduction: [4, 4, 4, 4]
+    spatial_kernel_size: [7, 7, 5, 3]
+
+  caffm:
+    reduction: [4, 4, 4, 4]
+    use_cross: [true, true, true, true]
+    gamma_init: -2.0
+    attn_drop: 0.1
+    proj_drop: 0.1
+    attention_type: [window, window, window, window]
+    window_size: [7, 7, 7, 7]
+    qkv_bias: false
+    fusion_type: concat
+    fusion_gamma_init: -2.0
+
+decoder:
+  type: mlp
+  embed_dim: 768
+  dropout_ratio: 0.1
+  align_corners: false
+

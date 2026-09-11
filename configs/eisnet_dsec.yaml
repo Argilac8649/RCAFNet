@@ -1,0 +1,71 @@
+### EISNet original-style config on DSEC ###
+
+model: esinet
+train_dataset: dsec
+modality: rgb_event
+seed: 2
+
+data_root: /home/cdw/dsec_data
+img_size_wh: [640, 440]
+num_class: 11
+ignore_index: 255
+
+image_channels: 3
+crop_bottom: 40
+use_rectify: true
+
+# Original EISNet event representation: AET with nr_bins=3.
+frame_type: aet
+use_precomputed_events: false
+precomputed_event_root: /home/cdw/dsec_data/precomputed_event/aet_rectified_crop40_640x440
+normalize_image: false
+normalize_event: false
+
+batch_size: 8
+num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 4
+
+epoch_size: null
+num_epochs: 60
+log_interval: 30
+log_dir: outputs/logs
+
+learning_rate: 0.00006
+weight_decay: 0.01
+label_smoothing: 0.0
+
+scheduler:
+  type: polynomial
+  power: 1.0
+  step_per_iteration: true
+
+loss:
+  type: ce
+
+# EISNet DSEC augmentation uses random scale/crop + horizontal flip.
+augmentation:
+  hflip_prob: 0.5
+  scale_crop_prob: 1.0
+  scale_range: [1.02, 1.2]
+
+encoder:
+  backbone: mit_b2
+  rgb_backbone: mit_b2
+  event_backbone: mit_b0
+  rgb_in_chans: 3
+  aet_rep: true
+  aet_bins: 3
+  rgb_pretrained: /home/cdw/python_project/Mit_Reg/pretrained_weights/segformer_b2_backbone_weights.pth
+  event_pretrained: /home/cdw/python_project/Mit_Reg/pretrained_weights/segformer_b0_backbone_weights.pth
+  mrfm:
+    head_count: 4
+    reduction: 16
+
+decoder:
+  type: mlp
+  embed_dim: 768
+  dropout_ratio: 0.1
+  align_corners: false
+
