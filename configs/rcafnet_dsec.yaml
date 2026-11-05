@@ -35,7 +35,7 @@ scheduler:
   eta_min: 0.000001
 
 loss:
-  type: ce
+  type: ce_lovasz
 
 num_epochs: 40
 epoch_size: null
