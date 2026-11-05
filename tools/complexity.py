@@ -8,13 +8,14 @@ from collections import defaultdict
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT))
+SOURCE_ROOT = PROJECT_ROOT / "src"
+sys.path[:0] = [str(SOURCE_ROOT), str(PROJECT_ROOT)]
 
 import torch
 import torch.nn as nn
 
 from src.config.load import load_config
-from src.models.backbones.mit import frame_type_to_event_in_chans
+from src.models.backbones.mit import Attention as MiTAttention, frame_type_to_event_in_chans
 from src.models.build import build_model
 from src.utils.device import default_device
 
@@ -74,7 +75,11 @@ def _input_hw(config, args):
 
 def _image_channels(config) -> int:
     encoder_cfg = _cfg_get(config, "encoder", None)
-    value = _cfg_get(encoder_cfg, "rgb_in_chans", _cfg_get(config, "image_channels", 3))
+    value = _cfg_get(
+        encoder_cfg,
+        "rgb_in_chans",
+        _cfg_get(config, "image_channels", 3),
+    )
     return int(value)
 
 
@@ -124,48 +129,22 @@ def token_efficient_cross_attention_macs(module: nn.Module, inputs) -> int:
     return int(4 * batch * heads * tokens * head_dim * head_dim)
 
 
-def token_window_cross_attention_macs(module: nn.Module, inputs) -> int:
-    if not inputs or not isinstance(inputs[0], torch.Tensor):
-        return 0
-    x = inputs[0]
-    if x.ndim != 3:
-        return 0
-    height = inputs[2] if len(inputs) > 2 else None
-    width = inputs[3] if len(inputs) > 3 else None
-    if height is None or width is None:
-        last_hw = getattr(module, "_last_hw", None)
-        if last_hw is not None:
-            height, width = last_hw
-    if height is None or width is None:
-        return 0
-    batch, _, channels = x.shape
-    heads = int(getattr(module, "num_heads", 1))
-    window_h, window_w = getattr(module, "window_size", (1, 1))
-    head_dim = channels // heads
-    num_windows_h = (int(height) + window_h - 1) // window_h
-    num_windows_w = (int(width) + window_w - 1) // window_w
-    window_tokens = window_h * window_w
-    num_windows = batch * num_windows_h * num_windows_w
-    return int(4 * num_windows * heads * window_tokens * window_tokens * head_dim)
-
-
 def nchw_efficient_cross_attention_macs(module: nn.Module, inputs) -> int:
-    if not inputs or not isinstance(inputs[0], torch.Tensor):
-        return 0
-    x = inputs[0]
-    if x.ndim != 4:
-        return 0
-    batch, _, height, width = x.shape
-    tokens = height * width
-    heads = int(getattr(module, "head_count", 1))
-    key_channels = int(getattr(module, "key_channels", 0))
-    value_channels = int(getattr(module, "value_channels", 0))
-    if heads <= 0 or key_channels <= 0 or value_channels <= 0:
-        return 0
-    key_per_head = key_channels // heads
-    value_per_head = value_channels // heads
-    # Per head: K@V^T and context^T@Q.
-    return int(2 * batch * heads * tokens * key_per_head * value_per_head)
+    """Count EISNet's K @ V.T and context.T @ Q; projections use child hooks."""
+    batch, _, height, width = inputs[0].shape
+    heads = int(module.head_count)
+    key_per_head = int(module.key_channels) // heads
+    value_per_head = int(module.value_channels) // heads
+    return int(2 * batch * heads * height * width * key_per_head * value_per_head)
+
+
+def spatial_reduction_attention_macs(module: nn.Module, inputs) -> int:
+    """Count Q @ K.T and attention @ V; child hooks count projections."""
+    x, height, width = inputs
+    batch, query_tokens, channels = x.shape
+    ratio = int(module.sr_ratio)
+    key_tokens = (int(height) // ratio) * (int(width) // ratio) if ratio > 1 else query_tokens
+    return int(2 * batch * query_tokens * key_tokens * channels)
 
 
 class ComplexityProfiler:
@@ -202,15 +181,17 @@ class ComplexityProfiler:
                 macs = layernorm_macs(output)
             elif class_name == "EfficientTokenCrossAttention":
                 macs = token_efficient_cross_attention_macs(mod, inputs)
-            elif class_name == "WindowCrossAttention":
-                macs = token_window_cross_attention_macs(mod, inputs)
             elif class_name == "EfficientCrossAttention":
                 macs = nchw_efficient_cross_attention_macs(mod, inputs)
+            elif isinstance(mod, MiTAttention):
+                macs = spatial_reduction_attention_macs(mod, inputs)
             self._record(name, mod, macs, output)
 
         return fn
 
     def profile(self, model: nn.Module, inputs):
+        self.records.clear()
+        self.by_type.clear()
         for name, module in model.named_modules():
             if not name:
                 continue
@@ -219,10 +200,8 @@ class ComplexityProfiler:
                 self.handles.append(module.register_forward_hook(self._hook(name, module)))
             elif self.include_norm and isinstance(module, (nn.BatchNorm2d, nn.SyncBatchNorm, nn.LayerNorm)):
                 self.handles.append(module.register_forward_hook(self._hook(name, module)))
-            elif class_name in {
-                "EfficientTokenCrossAttention",
-                "WindowCrossAttention",
-                "EfficientCrossAttention",
+            elif isinstance(module, MiTAttention) or class_name in {
+                "EfficientTokenCrossAttention", "EfficientCrossAttention",
             }:
                 self.handles.append(module.register_forward_hook(self._hook(name, module)))
 
@@ -310,7 +289,7 @@ def main(args):
         "latency_ms": latency_ms,
         "by_type_macs": dict(sorted(profiler.by_type.items(), key=lambda item: item[1], reverse=True)),
         "note": (
-            "MACs include Conv2d/Linear and custom cross-attention matrix "
+            "MACs include Conv2d/Linear, MiT spatial-reduction attention, and custom cross-attention matrix "
             "multiplications. Elementwise ops, interpolation and most "
             "activations are not counted."
         ),
@@ -342,7 +321,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Estimate RCAFNet model parameters and MACs/FLOPs.")
+    parser = argparse.ArgumentParser(
+        description="Estimate RCAFNet parameters, MACs, FLOPs, and latency."
+    )
     parser.add_argument("--config", type=str, required=True, help="Complete experiment config YAML.")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--input_size", type=int, nargs=2, default=None, metavar=("HEIGHT", "WIDTH"))
@@ -354,4 +335,3 @@ if __name__ == "__main__":
     parser.add_argument("--repeats", type=int, default=0)
     parser.add_argument("--output", type=str, default=None)
     main(parser.parse_args())
-

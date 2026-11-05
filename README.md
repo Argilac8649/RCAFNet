@@ -25,6 +25,10 @@ RCAFNet/
     train.py                  # Main training entry point
     precompute_dsec_events.py # Optional DSEC event-frame cache builder
     complexity.py             # Parameter, MAC/FLOP and latency profiler
+    dsec_natural_degradation.py # Input-quality audit and frozen subsets
+    evaluate_natural_subset100.py # Stratified subset checkpoint comparison
+    evaluate_natural_advantage100.py # Post-hoc advantage cases and pool caches
+    evaluate_natural_severe100.py # Input-severity-ranked subsets (30 or 100)
     visualize_segmentation.py # Save RGB/event/prediction/label visualizations
     visualize_attention.py    # Save CrossFE/CAFFM attention/debug maps
     evaluate.py               # Placeholder
@@ -55,6 +59,7 @@ The main RCAFNet path uses:
 - `10c` event representation, or `aet` for EISNet configs.
 - Cross Feature Recalibration to mutually calibrate image and event features.
 - Cross-Attention Fusion to integrate the recalibrated RGB/event features.
+- Efficient cross-attention in all fusion stages (`attention_type: efficient`).
 - MLP decoder head by default.
 
 ## Environment
@@ -67,6 +72,12 @@ pip install torch torchvision timm numpy pillow matplotlib tqdm pyyaml omegaconf
 ```
 
 Use a CUDA-enabled PyTorch build if training on GPU.
+
+The natural degradation tools additionally require OpenCV and SciPy:
+
+```bash
+pip install opencv-python scipy
+```
 
 ## Configs
 
@@ -221,7 +232,49 @@ python tools/complexity.py --config configs/rcafnet_dsec.yaml --device cuda:0 --
 
 The profiler reports parameters, trainable parameters, MACs, estimated FLOPs,
 optional latency, per-module MAC totals, and the most expensive modules. MACs
-cover Conv2d, Linear, and the custom cross-attention matrix multiplications.
+cover Conv2d, Linear, MiT spatial-reduction attention, and the custom efficient
+cross-attention matrix multiplications in RCAFNet and EISNet. Projection layers
+are counted separately from attention matrix products. Normalization is excluded
+by default and can be enabled with `--include_norm`; elementwise operations,
+pooling, interpolation, and activations are excluded. FLOPs are estimated as
+twice the MAC count. Pretrained weights are disabled unless `--load_pretrained`
+is specified.
+
+## Natural Degradation Analysis
+
+Audit DSEC validation inputs and freeze degraded subsets with matched controls:
+
+```bash
+python tools/dsec_natural_degradation.py audit --config configs/rcafnet_dsec.yaml --output_dir outputs/natural_degradation/dsec
+python tools/dsec_natural_degradation.py select --output_dir outputs/natural_degradation/dsec --fraction 0.10
+```
+
+`audit` computes image/event quality statistics and label histograms without model
+predictions. `select` freezes the input-quality-based subsets before evaluation.
+The `evaluate` subcommand compares aligned prediction caches containing
+`predictions.npy`, `sample_ids.json`, and `labels.npy` (labels are required in the
+RCAFNet cache). `evaluate_scores` summarizes per-frame score tables. Run the
+subcommands with `--help` for their arguments.
+
+The additional experiment scripts share the audit files and checkpoint paths
+configured by `AUDIT` and `RUNS` in `tools/evaluate_natural_subset100.py`:
+
+- `evaluate_natural_subset100.py` selects 100 frames per condition using fixed,
+  sequence-stratified sampling, matches controls, and runs checkpoint inference.
+- `evaluate_natural_advantage100.py` reuses the subset caches, infers the remaining
+  candidate/control frames, and saves full-pool confusion matrices. Its advantage
+  cases are selected by model performance and are descriptive post-hoc analyses.
+- `evaluate_natural_severe100.py --count 100` (or `--count 30`) selects frames by
+  the existing input-degradation scores and reuses the full-pool caches saved by
+  the advantage script. Its selection is independent of model predictions.
+
+For these experiment scripts, run the audit and selection first, then the subset,
+advantage, and severe scripts in that order. Their dated output/cache directory
+names preserve the original experiment layout. Update `RUNS` for your local
+checkpoint directories before inference; checkpoints must strictly match the
+model builders and configuration used to produce them. The repository does not
+include datasets, experiment checkpoints, or prediction caches. Per-frame mean
+mIoU and mIoU from an aggregate confusion matrix are reported separately.
 
 ## Metrics and Losses
 

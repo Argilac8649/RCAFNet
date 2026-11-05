@@ -50,29 +50,13 @@ def _debug_detach(x: torch.Tensor, to_cpu: bool = False) -> torch.Tensor:
 
 # Fusion
 
-def _to_2tuple(value):
-    if (
-        isinstance(value, (tuple, list))
-        or (
-            value is not None
-            and not isinstance(value, (str, bytes))
-            and hasattr(value, "__iter__")
-        )
-    ):
-        values = list(value)
-        if len(values) != 2:
-            raise ValueError(f"Expected a 2-tuple/list value, got {value}.")
-        return int(values[0]), int(values[1])
-    return int(value), int(value)
-
-
 def _normalize_attention_type(attention_type):
     attention_type = str(attention_type).strip().lower()
-    allowed = {"efficient", "window"}
+    allowed = {"efficient"}
     if attention_type not in allowed:
         raise ValueError(
             f"Unknown attention_type='{attention_type}'. "
-            "Expected 'efficient' or 'window'."
+            "Expected 'efficient'."
         )
     return attention_type
 

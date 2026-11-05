@@ -67,7 +67,6 @@ encoder:
     attn_drop: 0.1
     proj_drop: 0.1
     attention_type: [efficient, efficient, efficient, efficient]
-    window_size: [7, 7, 7, 7]
     qkv_bias: false
     fusion_type: concat
     fusion_gamma_init: -2.0

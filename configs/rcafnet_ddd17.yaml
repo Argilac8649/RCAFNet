@@ -46,7 +46,7 @@ scheduler:
   eta_min: 0.000001
 
 loss:
-  type: ce
+  type: ce_lovasz
 
 num_epochs: 40
 epoch_size: null
@@ -77,8 +77,7 @@ encoder:
     gamma_init: -2.0
     attn_drop: 0.1
     proj_drop: 0.1
-    attention_type: [window, window, window, window]
-    window_size: [7, 7, 7, 7]
+    attention_type: [efficient, efficient, efficient, efficient]
     qkv_bias: false
     fusion_type: concat
     fusion_gamma_init: -2.0

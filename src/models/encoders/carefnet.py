@@ -23,7 +23,6 @@ from ..necks.carefnet_fusion import (
 )
 from ..necks.cross_fe import CrossFeatureRecalibration
 from ..necks.feature_enhance import FeatureEnhance
-from ..necks.quality_rectify import QAFRM
 
 
 def _cfg_get(cfg, key, default=None):
@@ -457,6 +456,8 @@ class CAREFNetEncoder(nn.Module):
                 "Expected 'qafrm'. Use encoder.rectifier.enabled=false to disable it."
             )
 
+        from ..necks.quality_rectify import QAFRM
+
         spatial_hidden_dims = _as_stage_list(
             _cfg_get(rectifier_cfg, "spatial_hidden_dim", 8),
             num_stages=num_stages,
@@ -552,25 +553,10 @@ class CAREFNetEncoder(nn.Module):
             num_stages=num_stages,
             name="encoder.caffm.attention_type",
         )
-        window_sizes = _as_stage_list(
-            _cfg_get(caffm_cfg, "window_size", 7),
-            num_stages=num_stages,
-            name="encoder.caffm.window_size",
-        )
-        shift_sizes = _as_stage_list(
-            _cfg_get(caffm_cfg, "shift_size", None),
-            num_stages=num_stages,
-            name="encoder.caffm.shift_size",
-        )
         qkv_biases = _as_stage_list(
             _cfg_get(caffm_cfg, "qkv_bias", False),
             num_stages=num_stages,
             name="encoder.caffm.qkv_bias",
-        )
-        qk_scales = _as_stage_list(
-            _cfg_get(caffm_cfg, "qk_scale", None),
-            num_stages=num_stages,
-            name="encoder.caffm.qk_scale",
         )
 
         fusion_gamma_cfg = _cfg_get(caffm_cfg, "fusion_gamma_init", None)
@@ -605,10 +591,7 @@ class CAREFNetEncoder(nn.Module):
             caffm_kwargs = {
                 **common_kwargs,
                 "attention_type": str(attention_types[i]),
-                "window_size": window_sizes[i],
-                "shift_size": shift_sizes[i],
                 "qkv_bias": _to_bool(qkv_biases[i]),
-                "qk_scale": qk_scales[i],
             }
             if dim_rgb == dim_event:
                 modules.append(CAFFM(dim=dim_rgb, **caffm_kwargs))

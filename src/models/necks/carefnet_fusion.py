@@ -2,7 +2,6 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 try:
     from timm.layers import trunc_normal_
@@ -50,29 +49,13 @@ def _debug_detach(x: torch.Tensor, to_cpu: bool = False) -> torch.Tensor:
 
 # Fusion
 
-def _to_2tuple(value):
-    if (
-        isinstance(value, (tuple, list))
-        or (
-            value is not None
-            and not isinstance(value, (str, bytes))
-            and hasattr(value, "__iter__")
-        )
-    ):
-        values = list(value)
-        if len(values) != 2:
-            raise ValueError(f"Expected a 2-tuple/list value, got {value}.")
-        return int(values[0]), int(values[1])
-    return int(value), int(value)
-
-
 def _normalize_attention_type(attention_type):
     attention_type = str(attention_type).strip().lower()
-    allowed = {"efficient", "window"}
+    allowed = {"efficient"}
     if attention_type not in allowed:
         raise ValueError(
             f"Unknown attention_type='{attention_type}'. "
-            "Expected 'efficient' or 'window'."
+            "Expected 'efficient'."
         )
     return attention_type
 
@@ -198,279 +181,11 @@ class EfficientTokenCrossAttention(nn.Module):
         return out1, out2
 
 
-class WindowCrossAttention(nn.Module):
-    """
-    Local window cross-attention.
-
-    Each RGB token only attends to Event tokens inside the same spatial window,
-    and vice versa. This provides explicit local spatial matching while avoiding
-    the N x N attention map of global attention.
-    """
-
-    def __init__(
-        self,
-        dim,
-        num_heads=1,
-        window_size=7,
-        shift_size=None,
-        qkv_bias=False,
-        qk_scale=None,
-        attn_drop=0.0,
-    ):
-        super(WindowCrossAttention, self).__init__()
-        self.dim = int(dim)
-        if num_heads is None:
-            num_heads = 1
-        self.num_heads = int(num_heads)
-        if self.dim <= 0:
-            raise ValueError(f"dim should be positive, got {dim}.")
-        if self.num_heads <= 0:
-            raise ValueError(f"num_heads should be positive, got {num_heads}.")
-        if self.dim % self.num_heads != 0:
-            raise ValueError(
-                f"dim={self.dim} should be divisible by num_heads={self.num_heads}."
-            )
-
-        window_h, window_w = _to_2tuple(window_size)
-        if window_h <= 0 or window_w <= 0:
-            raise ValueError(f"window_size should be positive, got {window_size}.")
-
-        if shift_size is None:
-            shift_h, shift_w = window_h // 2, window_w // 2
-        else:
-            shift_h, shift_w = _to_2tuple(shift_size)
-        if shift_h < 0 or shift_w < 0:
-            raise ValueError(f"shift_size should be non-negative, got {shift_size}.")
-        if shift_h >= window_h or shift_w >= window_w:
-            raise ValueError(
-                f"shift_size={shift_size} should be smaller than "
-                f"window_size={window_size}."
-            )
-
-        self.window_size = (window_h, window_w)
-        self.shift_size = (shift_h, shift_w)
-        head_dim = self.dim // self.num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-        self._attn_mask_cache = {}
-        self._last_hw = None
-
-        self.q1 = nn.Linear(self.dim, self.dim, bias=qkv_bias)
-        self.q2 = nn.Linear(self.dim, self.dim, bias=qkv_bias)
-        self.kv1 = nn.Linear(self.dim, self.dim * 2, bias=qkv_bias)
-        self.kv2 = nn.Linear(self.dim, self.dim * 2, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-
-    def forward(self, x1, x2, H=None, W=None):
-        if H is None or W is None:
-            raise ValueError("WindowCrossAttention requires H and W.")
-
-        B, N, C = _check_token_pair(x1, x2, self.dim, "WindowCrossAttention")
-        H = int(H)
-        W = int(W)
-        if N != H * W:
-            raise ValueError(f"Expected N=H*W, got N={N}, H={H}, W={W}.")
-        self._last_hw = (H, W)
-
-        shift = self._effective_shift(H, W)
-        x1_q_windows, valid_windows, pad_info = self._window_partition(
-            self.q1(x1),
-            H,
-            W,
-            shift=shift,
-            need_valid=True,
-        )
-        x2_q_windows, _, _ = self._window_partition(
-            self.q2(x2),
-            H,
-            W,
-            shift=shift,
-        )
-        x1_windows, _, _ = self._window_partition(x1, H, W, shift=shift)
-        x2_windows, _, _ = self._window_partition(x2, H, W, shift=shift)
-        num_windows = x1_windows.shape[0]
-        window_tokens = x1_windows.shape[1]
-        head_dim = self.dim // self.num_heads
-
-        q1 = x1_q_windows.reshape(
-            num_windows, window_tokens, self.num_heads, head_dim
-        ).permute(0, 2, 1, 3)
-        q2 = x2_q_windows.reshape(
-            num_windows, window_tokens, self.num_heads, head_dim
-        ).permute(0, 2, 1, 3)
-
-        k1, v1 = self.kv1(x1_windows).reshape(
-            num_windows, window_tokens, 2, self.num_heads, head_dim
-        ).permute(2, 0, 3, 1, 4)
-        k2, v2 = self.kv2(x2_windows).reshape(
-            num_windows, window_tokens, 2, self.num_heads, head_dim
-        ).permute(2, 0, 3, 1, 4)
-
-        key_mask = valid_windows[:, None, None, :]
-        mask_value = torch.finfo(q1.dtype).min
-        shift_mask = self._shift_attention_mask(
-            batch_size=B,
-            pad_info=pad_info,
-            shift=shift,
-            device=x1.device,
-        )
-
-        attn_12 = (q1 @ k2.transpose(-2, -1)) * self.scale
-        attn_12 = attn_12.masked_fill(~key_mask, mask_value)
-        if shift_mask is not None:
-            attn_12 = attn_12.masked_fill(shift_mask[:, None, :, :], mask_value)
-        attn_12 = attn_12.softmax(dim=-1)
-        attn_12 = self.attn_drop(attn_12)
-
-        attn_21 = (q2 @ k1.transpose(-2, -1)) * self.scale
-        attn_21 = attn_21.masked_fill(~key_mask, mask_value)
-        if shift_mask is not None:
-            attn_21 = attn_21.masked_fill(shift_mask[:, None, :, :], mask_value)
-        attn_21 = attn_21.softmax(dim=-1)
-        attn_21 = self.attn_drop(attn_21)
-
-        out1_windows = (
-            attn_12 @ v2
-        ).transpose(1, 2).reshape(num_windows, window_tokens, C)
-        out2_windows = (
-            attn_21 @ v1
-        ).transpose(1, 2).reshape(num_windows, window_tokens, C)
-
-        out1 = self._window_reverse(out1_windows, B, H, W, pad_info)
-        out2 = self._window_reverse(out2_windows, B, H, W, pad_info)
-        return out1, out2
-
-    def _effective_shift(self, H: int, W: int):
-        window_h, window_w = self.window_size
-        shift_h, shift_w = self.shift_size
-        if H <= window_h:
-            shift_h = 0
-        if W <= window_w:
-            shift_w = 0
-        return shift_h, shift_w
-
-    @staticmethod
-    def _partition_spatial(x, window_h: int, window_w: int):
-        B, Hp, Wp, C = x.shape
-        x = x.reshape(
-            B,
-            Hp // window_h,
-            window_h,
-            Wp // window_w,
-            window_w,
-            C,
-        )
-        return x.permute(0, 1, 3, 2, 4, 5).reshape(
-            -1,
-            window_h * window_w,
-            C,
-        )
-
-    def _window_partition(self, tokens, H, W, shift=(0, 0), need_valid=False):
-        B, N, C = tokens.shape
-        window_h, window_w = self.window_size
-        shift_h, shift_w = shift
-
-        pad_h = (window_h - H % window_h) % window_h
-        pad_w = (window_w - W % window_w) % window_w
-        Hp = H + pad_h
-        Wp = W + pad_w
-
-        x = tokens.reshape(B, H, W, C)
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-        if shift_h > 0 or shift_w > 0:
-            x = torch.roll(x, shifts=(-shift_h, -shift_w), dims=(1, 2))
-
-        windows = self._partition_spatial(x, window_h, window_w)
-
-        valid_windows = None
-        if need_valid:
-            valid = torch.ones(B, H, W, device=tokens.device, dtype=torch.bool)
-            if pad_h > 0 or pad_w > 0:
-                valid = F.pad(valid, (0, pad_w, 0, pad_h), value=False)
-            if shift_h > 0 or shift_w > 0:
-                valid = torch.roll(valid, shifts=(-shift_h, -shift_w), dims=(1, 2))
-            valid_windows = self._partition_spatial(
-                valid.unsqueeze(-1),
-                window_h,
-                window_w,
-            ).squeeze(-1)
-
-        pad_info = (Hp, Wp, window_h, window_w, shift_h, shift_w)
-        return windows, valid_windows, pad_info
-
-    @staticmethod
-    def _mask_slices(length: int, window: int, shift: int):
-        if shift <= 0:
-            return (slice(0, length),)
-        return (
-            slice(0, -window),
-            slice(-window, -shift),
-            slice(-shift, None),
-        )
-
-    def _shift_attention_mask(self, batch_size, pad_info, shift, device):
-        shift_h, shift_w = shift
-        if shift_h <= 0 and shift_w <= 0:
-            return None
-
-        Hp, Wp, window_h, window_w, _, _ = pad_info
-        key = (
-            Hp,
-            Wp,
-            window_h,
-            window_w,
-            shift_h,
-            shift_w,
-            device.type,
-            device.index,
-        )
-        attn_mask = self._attn_mask_cache.get(key)
-        if attn_mask is None:
-            img_mask = torch.zeros((1, Hp, Wp, 1), device=device, dtype=torch.int64)
-            count = 0
-            h_slices = self._mask_slices(Hp, window_h, shift_h)
-            w_slices = self._mask_slices(Wp, window_w, shift_w)
-            for h_slice in h_slices:
-                for w_slice in w_slices:
-                    img_mask[:, h_slice, w_slice, :] = count
-                    count += 1
-
-            mask_windows = self._partition_spatial(img_mask, window_h, window_w)
-            mask_windows = mask_windows.squeeze(-1)
-            attn_mask = mask_windows.unsqueeze(1) != mask_windows.unsqueeze(2)
-            self._attn_mask_cache[key] = attn_mask
-
-        return attn_mask.repeat(batch_size, 1, 1)
-
-    @staticmethod
-    def _window_reverse(windows, B, H, W, pad_info):
-        Hp, Wp, window_h, window_w, shift_h, shift_w = pad_info
-        C = windows.shape[-1]
-
-        x = windows.reshape(
-            B,
-            Hp // window_h,
-            Wp // window_w,
-            window_h,
-            window_w,
-            C,
-        )
-        x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, C)
-        if shift_h > 0 or shift_w > 0:
-            x = torch.roll(x, shifts=(shift_h, shift_w), dims=(1, 2))
-        x = x[:, :H, :W, :]
-        return x.reshape(B, H * W, C)
-
-
 def build_cross_attention(
     attention_type,
     dim,
     num_heads=1,
-    window_size=7,
-    shift_size=None,
     qkv_bias=False,
-    qk_scale=None,
     attn_drop=0.0,
 ):
     attention_type = _normalize_attention_type(attention_type)
@@ -479,16 +194,6 @@ def build_cross_attention(
             dim=dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-        )
-    if attention_type == "window":
-        return WindowCrossAttention(
-            dim=dim,
-            num_heads=num_heads,
-            window_size=window_size,
-            shift_size=shift_size,
-            qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             attn_drop=attn_drop,
         )
     raise RuntimeError(f"Unsupported attention_type='{attention_type}'.")
@@ -500,7 +205,6 @@ class CrossPath(nn.Module):
 
     attention_type:
         - "efficient": original efficient attention, O(N * d^2)
-        - "window": local window cross-attention, O(N * window_size^2 * d)
     """
 
     def __init__(
@@ -514,10 +218,7 @@ class CrossPath(nn.Module):
         attn_drop=0.0,
         proj_drop=0.0,
         attention_type="efficient",
-        window_size=7,
-        shift_size=None,
         qkv_bias=False,
-        qk_scale=None,
     ):
         super(CrossPath, self).__init__()
         self.dim = int(dim)
@@ -528,8 +229,6 @@ class CrossPath(nn.Module):
 
         self.use_cross = use_cross
         self.attention_type = _normalize_attention_type(attention_type)
-        self.window_size = _to_2tuple(window_size)
-        self.shift_size = None if shift_size is None else _to_2tuple(shift_size)
         if not use_cross:
             return
 
@@ -555,11 +254,8 @@ class CrossPath(nn.Module):
             attention_type=self.attention_type,
             dim=hidden_dim,
             num_heads=num_heads,
-            window_size=self.window_size,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
             attn_drop=attn_drop,
-            shift_size=self.shift_size,
         )
         self.end_proj1 = nn.Linear(hidden_dim * 2, self.dim)
         self.end_proj2 = nn.Linear(hidden_dim * 2, self.dim)
@@ -674,7 +370,6 @@ class CAFFM(nn.Module):
 
     attention_type:
         - "efficient": original efficient cross-attention
-        - "window": local window cross-attention
     """
 
     def __init__(
@@ -690,10 +385,7 @@ class CAFFM(nn.Module):
         fusion_type="concat",
         fusion_gamma_init=None,
         attention_type="efficient",
-        window_size=7,
-        shift_size=None,
         qkv_bias=False,
-        qk_scale=None,
     ):
         super(CAFFM, self).__init__()
         self.dim = int(dim)
@@ -708,8 +400,6 @@ class CAFFM(nn.Module):
             )
         self.fusion_type = fusion_type
         self.attention_type = _normalize_attention_type(attention_type)
-        self.window_size = _to_2tuple(window_size)
-        self.shift_size = None if shift_size is None else _to_2tuple(shift_size)
 
         self.cross = CrossPath(
             dim=self.dim,
@@ -721,10 +411,7 @@ class CAFFM(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
             attention_type=self.attention_type,
-            window_size=self.window_size,
-            shift_size=self.shift_size,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
         )
         self.channel_emb = FusionChannelEmbed(
             in_channels=self.dim * 2,
@@ -832,13 +519,6 @@ class CAFFM(nn.Module):
         height: int,
         width: int,
     ) -> None:
-        cross_attn = getattr(self.cross, "cross_attn", None)
-        shift_size = getattr(cross_attn, "shift_size", self.shift_size)
-        if hasattr(cross_attn, "_effective_shift"):
-            effective_shift_size = cross_attn._effective_shift(height, width)
-        else:
-            effective_shift_size = None
-
         cache = {
             "rgb_before": _debug_feature_map(x1, self.debug_to_cpu),
             "event_before": _debug_feature_map(x2, self.debug_to_cpu),
@@ -870,9 +550,6 @@ class CAFFM(nn.Module):
             "output": _debug_feature_map(out, self.debug_to_cpu),
             "fusion_type": self.fusion_type,
             "attention_type": self.attention_type,
-            "window_size": self.window_size,
-            "shift_size": shift_size,
-            "effective_shift_size": effective_shift_size,
             "use_cross": bool(self.cross.use_cross),
         }
         if self.fusion_gamma_logit is not None:
@@ -911,10 +588,7 @@ class AsymmetricCAFFM(nn.Module):
         fusion_type="concat",
         fusion_gamma_init=None,
         attention_type="efficient",
-        window_size=7,
-        shift_size=None,
         qkv_bias=False,
-        qk_scale=None,
     ):
         super().__init__()
         self.dim_rgb = int(dim_rgb)
@@ -942,10 +616,7 @@ class AsymmetricCAFFM(nn.Module):
             fusion_type=fusion_type,
             fusion_gamma_init=fusion_gamma_init,
             attention_type=attention_type,
-            window_size=window_size,
-            shift_size=shift_size,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,
         )
         self._init_projection(self.event_to_rgb)
         self.debug_enabled = False
